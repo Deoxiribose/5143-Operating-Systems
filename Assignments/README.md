@@ -1,5 +1,5 @@
 ## Assignments
 
-|  #  | Folder Link | Assignment Description |
-| :-: | ----------- | ---------------------- |
-|  0  | link 0      | description 0          |
+|  #  | Folder Link      | Assignment Description |
+| :-: | ---------------- | ---------------------- |
+|  P1  | Assignments/P01 | Shell and Functions    |
