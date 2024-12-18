@@ -4,6 +4,13 @@ import datetime
 import re
 import readline
 import os
+from rich.console import Console
+from rich.markup import escape
+from help import help_command
+
+
+
+console = Console()
 
 # Connect to the SQLite database (or create it if it doesn't exist)
 conn = sqlite3.connect('filesystem.db')
@@ -71,7 +78,7 @@ conn.commit()
 COMMANDS = [
     'exit', 'register', 'login', 'logout', 'pwd', 'ls', 'cd',
     'mkdir', 'rmdir', 'touch', 'cat', 'echo', 'cp', 'mv', 'rm',
-    'chmod', 'head', 'tail', 'grep', 'wc', 'write'
+    'chmod', 'head', 'tail', 'grep', 'wc', 'write', 'help', 'history'
 ]
 
 HISTORY_FILE = os.path.expanduser('~/.my_shell_history')
@@ -108,6 +115,91 @@ def load_history():
 def save_history():
     readline.write_history_file(HISTORY_FILE)
 
+def clear(params):
+    # Clear the terminal screen
+    # ANSI escape code for clearing screen:
+    # \033[2J  clears the screen
+    # \033[H   moves the cursor to the home position (top-left)
+    print("\033[2J\033[H", end='')
+
+def echo(params, pipe_input=None):
+    """
+    Outputs content, writes to a file, or passes content through a pipeline.
+
+    :param params: List of arguments (content or redirection).
+    :param pipe_input: Input from a pipe, if provided.
+    :return: Content for further pipeline processing.
+    """
+    # Pipeline mode: pass piped input
+    if pipe_input:
+        return pipe_input
+
+    # Handle echoing text
+    if len(params) < 1:
+        print("Usage: echo <content>")
+        return None
+
+    # Check for redirection
+    if '>' in params or '>>' in params:
+        redirection = '>>' if '>>' in params else '>'
+        split_index = params.index(redirection)
+        if split_index + 1 >= len(params):
+            print(f"Usage: echo <content> {redirection} <file_name>")
+            return None
+
+        content = ' '.join(params[:split_index])
+        file_name = params[split_index + 1]
+
+        # Resolve file path
+        file_id = get_item_id_by_path(file_name, current_directory_id)
+        if not file_id:
+            print(f"File '{file_name}' does not exist. Creating it...")
+            touch([file_name])
+            file_id = get_item_id_by_path(file_name, current_directory_id)
+            if not file_id:
+                print(f"Error: Failed to create file '{file_name}'.")
+                return None
+
+        # Check write permission
+        if not has_permission(file_id, 'write'):
+            print(f"echo: cannot write to '{file_name}': Permission denied.")
+            return None
+
+        # Write or append content
+        cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
+        existing_content = cursor.fetchone()[0] or ""
+        new_content = existing_content + content if redirection == '>>' else content
+        now = datetime.datetime.now().isoformat()
+        cursor.execute('''
+        UPDATE filesystem
+        SET content = ?, size = ?, modification_date = ?
+        WHERE id = ?
+        ''', (new_content, len(new_content), now, file_id))
+        conn.commit()
+        print(f"Content written to '{file_name}'.")
+        return None
+
+    # Default: return content for pipeline or standard output
+    return ' '.join(params)
+
+
+def interpret_escape_sequences(text):
+    """
+    Interpret escape sequences in a string.
+
+    :param text: Input string with potential escape sequences.
+    :return: Processed string with escape sequences replaced.
+    """
+    escape_sequences = {
+        r'\n': '\n',
+        r'\t': '\t',
+        r'\\': '\\',
+        r'\'': '\'',
+        r'\"': '\"',
+    }
+    for seq, char in escape_sequences.items():
+        text = text.replace(seq, char)
+    return text
 
 
 # Initialize global variables
@@ -305,56 +397,171 @@ def format_size(size):
         size /= 1024
     return f"{size}P"
 
-# Filesystem command implementations
+
+from rich.console import Console
+from rich.text import Text
+
+console = Console()
+
 def ls(options=[]):
+    """
+    List directory contents with formatted output.
+    Options:
+        -a: Show all files, including hidden ones.
+        -l: Long format listing.
+        -h: Human-readable file sizes.
+    Supports combined options like -la, -ah, -lah.
+    """
+    # Ensure the current user has permissions to access the directory
     if not has_permission(current_directory_id, 'execute'):
-        print("Permission denied.")
+        console.print("Permission denied.", style="bold red")
         return
-    
+
     show_all = False
     long_format = False
     human_readable = False
-    
-    # Parse options
-    for option in options:
-        if option == '-a':
-            show_all = True
-        elif option == '-l':
-            long_format = True
-        elif option == '-h':
-            human_readable = True
-        else:
-            print(f"Unknown option: {option}")
-            return
-    
+
+    # Parse options, allowing combined flags (e.g., -lah)
+    combined_options = "".join(options)
+    show_all = 'a' in combined_options
+    long_format = 'l' in combined_options
+    human_readable = 'h' in combined_options
+
     # Fetch directory contents
     cursor.execute('''
-    SELECT name, type, permissions, owner_id, size, modification_date FROM filesystem
+    SELECT name, type, permissions, owner_id, size, modification_date 
+    FROM filesystem
     WHERE parent_id = ?
     ''', (current_directory_id,))
     items = cursor.fetchall()
-    
+
     if not items:
-        print("Directory is empty.")
+        console.print("Directory is empty.", style="bold cyan")
+        return
+
+    # Separate directories and files
+    directories = [item for item in items if item[1] == 'directory']
+    files = [item for item in items if item[1] == 'file']
+
+    # Display directories
+    console.print("Directories", style="bold cyan underline")
+    for directory in directories:
+        name = directory[0]
+        if not show_all and name.startswith('.'):
+            continue
+        console.print(f"  {name}", style="cyan")
+
+    # Display files
+    console.print("\nFiles", style="bold green underline")
+    for file in files:
+        name = file[0]
+        if not name.strip():
+            console.print("  [bold red]Error: File name is empty or invalid[/bold red]")
+            continue
+        if not show_all and name.startswith('.'):
+            continue
+        if long_format:
+            permissions = file[2]
+            owner_id = file[3]
+            size = file[4]
+            mod_date = file[5]
+
+            # Get owner's username
+            cursor.execute('SELECT username FROM users WHERE id = ?', (owner_id,))
+            owner_row = cursor.fetchone()
+            owner_name = owner_row[0] if owner_row else "unknown"
+
+            # Format size if human-readable is enabled
+            size_str = format_size(size) if human_readable else f"{size} B"
+
+            # Display file details
+            console.print(
+                f"  {permissions} {owner_name} {size_str} {mod_date} {name}",
+                style="green"
+            )
+        else:
+            console.print(f"  {name}", style="green")
+
+
+def handle_redirection(command_line):
+    if '>>' in command_line:
+        command, output_file = map(str.strip, command_line.split('>>', 1))
+        append = True
+    elif '>' in command_line:
+        command, output_file = map(str.strip, command_line.split('>', 1))
+        append = False
+    elif '<' in command_line:
+        command, input_file = map(str.strip, command_line.split('<', 1))
+        input_redirection(command, input_file)
+        return
     else:
-        for item in items:
-            name, item_type, permissions, owner_id, size, modification_date = item
-            # Skip hidden files if '-a' not specified
-            if not show_all and name.startswith('.'):
-                continue
-            if long_format:
-                # Fetch owner's username
-                cursor.execute('SELECT username FROM users WHERE id = ?', (owner_id,))
-                owner_name = cursor.fetchone()[0]
-                # Format size
-                display_size = size
-                if human_readable:
-                    display_size = format_size(size)
-                # Format date
-                date_str = modification_date.split('T')[0] if modification_date else ''
-                print(f"{permissions} {owner_name} {display_size} {date_str} {item_type}: {name}")
-            else:
-                print(f"{item_type}: {name}")
+        print("Invalid redirection syntax.")
+        return
+
+    # Output redirection (overwriting or appending)
+    output_redirection(command, output_file, append)
+
+def input_redirection(command, input_file):
+    file_id = get_item_id_by_path(input_file, current_directory_id)
+    if not file_id:
+        print(f"Input file '{input_file}' does not exist.")
+        return
+
+    cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
+    content = cursor.fetchone()
+    if not content:
+        print(f"Input file '{input_file}' is empty or unreadable.")
+        return
+
+    process_command(command, pipe_input=content[0])
+
+def output_redirection(command, output_file, append):
+    output = process_command(command)
+
+    if output is None:
+        return
+
+    file_id = get_item_id_by_path(output_file, current_directory_id)
+    if not file_id:
+        touch([output_file])
+        file_id = get_item_id_by_path(output_file, current_directory_id)
+
+    if not has_permission(file_id, 'write'):
+        print(f"Permission denied: '{output_file}'")
+        return
+
+    cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
+    existing_content = cursor.fetchone()[0] if append else ""
+
+    new_content = existing_content + output if append else output
+
+    now = datetime.datetime.now().isoformat()
+    cursor.execute('''
+    UPDATE filesystem
+    SET content = ?, size = ?, modification_date = ?
+    WHERE id = ?
+    ''', (new_content, len(new_content), now, file_id))
+    conn.commit()
+    print(f"Output written to '{output_file}'")
+
+def process_command(command, pipe_input=None):
+    args = command.strip().split()
+    if not args:
+        return
+
+    command = args[0]
+    params = args[1:]
+
+    if command == 'cat':
+        return cat(params, pipe_input)
+    elif command == 'grep':
+        return grep(params, pipe_input)
+    elif command == 'echo':
+        return echo(params)
+    elif command == 'wc':
+        return wc(params, pipe_input)
+    # Add other commands as needed
+
 
 def cd(directory_name=None):
     global current_directory_id
@@ -701,57 +908,38 @@ def is_subdirectory(source_id, destination_id):
     else:
         return False
 
-def head(params):
-    if not current_user:
-        print("No user logged in.")
-        return
+def head(params, pipe_input=None):
+    num_lines = 10  # Default to showing 10 lines
 
-    num_lines = 10  # Default number of lines
-    filename = None
-
-    # Parse command-line options
-    if not params:
-        print("Usage: head [-number_of_lines] <file_name>")
-        return
-
-    if params[0].startswith('-') and len(params[0]) > 1 and params[0][1:].isdigit():
-        num_lines = int(params[0][1:])
-        if len(params) == 2:
-            filename = params[1]
-        else:
-            print("Usage: head [-number_of_lines] <file_name>")
-            return
+    if pipe_input:
+        lines = pipe_input.split('\n')
     else:
-        filename = params[0]
+        if len(params) < 1:
+            print("Usage: head [-number_of_lines] <file_name>")
+            return ''
+        if params[0].startswith('-') and params[0][1:].isdigit():
+            num_lines = int(params[0][1:])
+            if len(params) > 1:
+                file_name = params[1]
+            else:
+                print("Usage: head [-number_of_lines] <file_name>")
+                return ''
+        else:
+            file_name = params[0]
 
-    # Resolve the file path
-    file_id = get_item_id_by_path(filename, current_directory_id)
-    if not file_id:
-        print(f"head: cannot open '{filename}': No such file")
-        return
+        file_id = get_item_id_by_path(file_name, current_directory_id)
+        if not file_id:
+            print(f"head: cannot open '{file_name}': No such file")
+            return ''
 
-    # Check if it's a file
-    cursor.execute('SELECT type FROM filesystem WHERE id = ?', (file_id,))
-    item_type = cursor.fetchone()[0]
-    if item_type != 'file':
-        print(f"head: '{filename}' is not a file")
-        return
+        cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
+        content = cursor.fetchone()[0]
+        lines = content.split('\n')
 
-    # Check read permission
-    if not has_permission(file_id, 'read'):
-        print(f"head: cannot open '{filename}': Permission denied")
-        return
+    return '\n'.join(lines[:num_lines])
 
-    # Get file content
-    cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
-    content = cursor.fetchone()[0]
-    lines = content.split('\n')
 
-    # Display the first 'n' lines
-    for line in lines[:num_lines]:
-        print(line)
-
-def tail(params):
+def tail(params, pipe_input=None):
     if not current_user:
         print("No user logged in.")
         return
@@ -759,175 +947,154 @@ def tail(params):
     num_lines = 10  # Default number of lines
     filename = None
 
-    # Parse command-line options
-    if not params:
+    # Parse parameters
+    if pipe_input:
+        content = pipe_input
+    elif len(params) == 1:
+        # Check if it's a number or filename
+        if params[0].startswith('-') and params[0][1:].isdigit():
+            num_lines = int(params[0][1:])
+            print("Usage: tail [-number_of_lines] <file_name>")
+            return
+        
+        else:
+            filename = params[0]
+    elif len(params) == 2 and params[0].startswith('-') and params[0][1:].isdigit():
+        num_lines = int(params[0][1:])
+        filename = params[1]
+    else:
         print("Usage: tail [-number_of_lines] <file_name>")
         return
 
-    if params[0].startswith('-') and len(params[0]) > 1 and params[0][1:].isdigit():
-        num_lines = int(params[0][1:])
-        if len(params) == 2:
-            filename = params[1]
-        else:
-            print("Usage: tail [-number_of_lines] <file_name>")
-            return
-    else:
-        filename = params[0]
-
-    # Resolve the file path
-    file_id = get_item_id_by_path(filename, current_directory_id)
-    if not file_id:
-        print(f"tail: cannot open '{filename}': No such file")
-        return
-
-    # Check if it's a file
-    cursor.execute('SELECT type FROM filesystem WHERE id = ?', (file_id,))
-    item_type = cursor.fetchone()[0]
-    if item_type != 'file':
-        print(f"tail: '{filename}' is not a file")
-        return
-
-    # Check read permission
-    if not has_permission(file_id, 'read'):
-        print(f"tail: cannot open '{filename}': Permission denied")
-        return
-
-    # Get file content
-    cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
-    content = cursor.fetchone()[0]
-    lines = content.split('\n')
-
-    # Display the last 'n' lines
-    for line in lines[-num_lines:]:
-        print(line)
-
-def parse_head_tail_params(params, command_name):
-    num_lines = 10  # Default number of lines
-    filename = None
-
-    if len(params) == 1:
-        filename = params[0]
-    elif len(params) == 3 and params[0] == '-n':
-        try:
-            num_lines = int(params[1])
-            if num_lines < 0:
-                print(f"{command_name}: invalid number of lines: '{num_lines}'")
-                return None, None
-        except ValueError:
-            print(f"{command_name}: invalid number of lines")
-            return None, None
-        filename = params[2]
-    else:
-        print(f"Usage: {command_name} [-n number_of_lines] <file_name>")
-        return None, None
-
-    return num_lines, filename
-
-def grep(params):
-    if not current_user:
-        print("No user logged in.")
-        return
-
-    # Initialize options
-    case_insensitive = False
-    line_numbers = False
-    patterns = []
-    filenames = []
-
-    # Parse options and arguments
-    idx = 0
-    while idx < len(params):
-        param = params[idx]
-        if param.startswith('-'):
-            if 'i' in param:
-                case_insensitive = True
-            if 'n' in param:
-                line_numbers = True
-            idx += 1
-        else:
-            break  # Options are over
-    if idx >= len(params):
-        print("Usage: grep [options] <pattern> <file1> [file2 ...]")
-        return
-    else:
-        # The next parameter is the pattern
-        pattern = params[idx]
-        idx += 1
-        # Remaining parameters are filenames
-        filenames = params[idx:]
-
-    if not pattern or not filenames:
-        print("Usage: grep [options] <pattern> <file1> [file2 ...]")
-        return
-
-    # Compile the pattern
-    flags = re.IGNORECASE if case_insensitive else 0
-    try:
-        regex = re.compile(pattern, flags)
-    except re.error as e:
-        print(f"grep: invalid regular expression: {e}")
-        return
-
-    # Search in each file
-    for filename in filenames:
+    # Handle file content
+    if not pipe_input:
         file_id = get_item_id_by_path(filename, current_directory_id)
         if not file_id:
-            print(f"grep: {filename}: No such file")
-            continue
+            print(f"tail: cannot open '{filename}': No such file")
+            return
 
         # Check if it's a file
         cursor.execute('SELECT type FROM filesystem WHERE id = ?', (file_id,))
         item_type = cursor.fetchone()[0]
         if item_type != 'file':
-            print(f"grep: {filename}: Is not a file")
-            continue
+            print(f"tail: '{filename}' is not a file")
+            return
 
         # Check read permission
         if not has_permission(file_id, 'read'):
-            print(f"grep: {filename}: Permission denied")
-            continue
+            print(f"tail: cannot open '{filename}': Permission denied")
+            return
 
         # Get file content
         cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
         content = cursor.fetchone()[0]
-        lines = content.split('\n')
 
-        # Search for the pattern in each line
-        for line_number, line in enumerate(lines, start=1):
-            if regex.search(line):
-                output = ''
-                if len(filenames) > 1:
-                    output += f"{filename}:"
-                if line_numbers:
-                    output += f"{line_number}:"
-                output += line
-                print(output)
+    # Split lines and handle edge cases
+    lines = content.splitlines()
+    if len(lines) == 0:
+        print("")  # No content to display
+        return
 
-def touch(file_name):
-    if not current_user:
-        print("No user logged in.")
-        return
-    if not has_permission(current_directory_id, 'write'):
-        print("Permission denied.")
-        return
-    # Check if the file already exists
-    cursor.execute('''
-    SELECT id FROM filesystem
-    WHERE name = ? AND type = 'file' AND parent_id = ?
-    ''', (file_name, current_directory_id))
-    if cursor.fetchone():
-        print(f"Error: File '{file_name}' already exists.")
-        return
-    try:
-        now = datetime.datetime.now().isoformat()
-        cursor.execute('''
-        INSERT INTO filesystem (name, type, parent_id, owner_id, content, size, modification_date)
-        VALUES (?, 'file', ?, ?, '', ?, ?)
-        ''', (file_name, current_directory_id, current_user['id'], 0, now))
-        conn.commit()
-        print(f"File '{file_name}' created.")
-    except sqlite3.IntegrityError as e:
-        print(f"Error: {e}")
+    # Display the last 'num_lines' lines
+    output_lines = lines[-num_lines:]
+    print('\n'.join(output_lines))
+
+def parse_head_tail_params(params, command_name):
+    """
+    Parses parameters for head and tail commands.
+    Supports:
+      - <file_name>
+      - -<number_of_lines> <file_name>
+      - -n <number_of_lines> <file_name>
+    """
+    num_lines = 10  # Default number of lines
+    filename = None
+
+    if len(params) == 1:
+        # Single parameter: assume it's the file name
+        filename = params[0]
+    elif len(params) == 2 and params[0].startswith('-') and params[0][1:].isdigit():
+        # Syntax: -<number> <file_name>
+        try:
+            num_lines = int(params[0][1:])
+            if num_lines < 0:
+                raise ValueError("Number of lines cannot be negative.")
+            filename = params[1]
+        except ValueError:
+            print(f"{command_name}: invalid number of lines: '{params[0]}'")
+            return None, None
+    elif len(params) == 3 and params[0] == '-n':
+        # Syntax: -n <number> <file_name>
+        try:
+            num_lines = int(params[1])
+            if num_lines < 0:
+                raise ValueError("Number of lines cannot be negative.")
+            filename = params[2]
+        except ValueError:
+            print(f"{command_name}: invalid number of lines: '{params[1]}'")
+            return None, None
+    else:
+        # Invalid syntax
+        print(f"Usage: {command_name} [-number_of_lines] <file_name>")
+        print(f"       {command_name} -n <number_of_lines> <file_name>")
+        return None, None
+
+    return num_lines, filename
+
+
+import re
+from rich.console import Console
+from rich.markup import escape
+
+console = Console()
+
+def grep(params, pipe_input=None):
+    """
+    Search for a pattern in the content from files or piped input.
+    :param params: Command-line arguments for grep.
+    :param pipe_input: Content passed through a pipeline.
+    """
+    if pipe_input:
+        # Split the piped content into lines
+        lines = pipe_input.split('\n')
+    else:
+        if len(params) < 2:
+            print("Usage: grep [options] <pattern> <file1> ...")
+            return ''
+        
+        pattern = params[0]
+        filenames = params[1:]
+        lines = []
+
+        # Process each file
+        for filename in filenames:
+            file_id = get_item_id_by_path(filename, current_directory_id)
+            if not file_id:
+                print(f"grep: {filename}: No such file")
+                continue
+
+            # Check read permissions
+            if not has_permission(file_id, 'read'):
+                print(f"grep: cannot read '{filename}': Permission denied")
+                continue
+
+            # Fetch file content
+            cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
+            content = cursor.fetchone()
+            if content:
+                lines.extend(content[0].split('\n'))
+
+    # Compile the regex
+    pattern = params[0]
+    regex = re.compile(pattern, re.IGNORECASE)
+
+    # Filter lines based on the regex
+    matches = [line for line in lines if regex.search(line)]
+
+    # Return the matched lines
+    return '\n'.join(matches)
+
+
 
 def rm(name):
     if not current_user:
@@ -975,56 +1142,51 @@ def delete_directory(dir_id):
                 print(f"Permission denied to delete item with ID '{item_id}'.")
     cursor.execute('DELETE FROM filesystem WHERE id = ?', (dir_id,))
 
-def cat(params):
-    if not current_user:
-        print("No user logged in.")
-        return ''
+def cat(params, pipe_input=None):
+    """
+    Displays file content or piped input.
 
-    output_data = ''
+    :param params: List of file names.
+    :param pipe_input: Input from a pipe, if provided.
+    :return: Content for the pipeline or None.
+    """
+    # Handle pipe input
+    if pipe_input:
+        return pipe_input
 
-    if len(params) < 1:
+    # Validate arguments for file operations
+    if not params:
         print("Usage: cat <file1> [file2 ...]")
-        return ''
+        return None
 
+    output_data = []
     for file_name in params:
-        #print(f"Debug: Attempting to cat '{file_name}'")  # Debugging
-
-        # Resolve the file path
+        # Resolve file path
         file_id = get_item_id_by_path(file_name, current_directory_id)
         if not file_id:
-            print(f"cat: cannot open '{file_name}': No such file")
+            print(f"cat: cannot open '{file_name}': No such file or directory")
             continue
 
-        # Check if it's a file
-        cursor.execute('SELECT type FROM filesystem WHERE id = ?', (file_id,))
+        # Check if it's a file and has read permission
+        cursor.execute('SELECT type, content FROM filesystem WHERE id = ?', (file_id,))
         result = cursor.fetchone()
         if not result:
-            print(f"cat: '{file_name}' does not exist in the filesystem.")
+            print(f"cat: cannot open '{file_name}': No such file or directory")
             continue
 
-        item_type = result[0]
+        item_type, content = result
         if item_type != 'file':
             print(f"cat: '{file_name}' is not a file")
             continue
 
-        # Check read permission
         if not has_permission(file_id, 'read'):
             print(f"cat: cannot open '{file_name}': Permission denied")
             continue
 
-        # Get file content
-        cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
-        content_result = cursor.fetchone()
-        if content_result is None:
-            print(f"cat: cannot retrieve content from '{file_name}'")
-            continue
+        output_data.append(content or '')
 
-        content = content_result[0]
-        #print(f"Debug: Retrieved content from '{file_name}': {content}")  # Debugging
+    return '\n'.join(output_data)
 
-        output_data += content + '\n'
-
-    return output_data.rstrip('\n')
 
 def view_file_content(file_name):
     file_id = get_item_id_by_path(file_name, current_directory_id)
@@ -1040,8 +1202,13 @@ def view_file_content(file_name):
     else:
         print(f"No content found for '{file_name}'")
 
+def write(params, pipe_input=None):
+    """
+    Write content to a file. Create the file if it does not exist.
 
-def write(params):
+    :param params: List of command-line arguments (expects one file name).
+    :param pipe_input: Input from a pipe, if provided.
+    """
     if not current_user:
         print("No user logged in.")
         return
@@ -1050,71 +1217,77 @@ def write(params):
         return
     file_name = params[0]
 
+    # Ensure the file exists
     file_id = get_item_id_by_path(file_name, current_directory_id)
     if not file_id:
-        # File does not exist, create it
-        touch(file_name)
+        print(f"File '{file_name}' does not exist. Creating it...")
+        touch([file_name])  # Use touch to create the file
         file_id = get_item_id_by_path(file_name, current_directory_id)
+        if not file_id:
+            print(f"Error: Failed to create file '{file_name}'.")
+            return
 
-    # Check write permission
+    # Check write permissions
     if not has_permission(file_id, 'write'):
-        print(f"write: cannot write to '{file_name}': Permission denied")
+        print(f"write: cannot write to '{file_name}': Permission denied.")
         return
 
-    print("Enter text. Type 'EOF' on a new line to finish.")
-    lines = []
-    while True:
-        line = input()
-        if line == 'EOF':
-            break
-        lines.append(line)
-    content = '\n'.join(lines)
+    # Use pipe input or prompt the user for content
+    content = pipe_input if pipe_input else ""
+    if not pipe_input:
+        print("Enter text. Type 'EOF' on a new line to finish.")
+        lines = []
+        while True:
+            line = input()
+            if line == 'EOF':
+                break
+            lines.append(line)
+        content = '\n'.join(lines)
 
-    now = datetime.datetime.now().isoformat()
-    cursor.execute('''
-    UPDATE filesystem
-    SET content = ?, size = ?, modification_date = ?
-    WHERE id = ?
-    ''', (content, len(content), now, file_id))
-    conn.commit()
-    print(f"Content written to '{file_name}'")
+    try:
+        # Update the file's content
+        now = datetime.datetime.now().isoformat()
+        cursor.execute('''
+        UPDATE filesystem
+        SET content = ?, size = ?, modification_date = ?
+        WHERE id = ?
+        ''', (content, len(content), now, file_id))
+        conn.commit()
+        print(f"Content written to '{file_name}'.")
+    except sqlite3.Error as e:
+        print(f"Error: {e}")
 
-def echo(params):
+def touch(params, pipe_input=None):
     if not current_user:
         print("No user logged in.")
         return
-    if len(params) < 2:
-        print("Usage: echo <file_name> <content>")
+    if len(params) != 1:
+        print("Usage: touch <file_name>")
         return
     file_name = params[0]
-    content = ' '.join(params[1:])
 
-    # Interpret escape sequences
-    content = interpret_escape_sequences(content)
-
-    # Resolve the file path
+    # Check if the file already exists
     file_id = get_item_id_by_path(file_name, current_directory_id)
-    if not file_id:
-        # File does not exist, create it
-        touch(file_name)
-        file_id = get_item_id_by_path(file_name, current_directory_id)
-
-    # Check write permission
-    if not has_permission(file_id, 'write'):
-        print(f"echo: cannot write to '{file_name}': Permission denied")
+    if file_id:
+        print(f"File '{file_name}' already exists.")
         return
 
-    now = datetime.datetime.now().isoformat()
-    cursor.execute('''
-    UPDATE filesystem
-    SET content = ?, size = ?, modification_date = ?
-    WHERE id = ?
-    ''', (content, len(content), now, file_id))
-    conn.commit()
-    print(f"Content written to '{file_name}'")
+    try:
+        # Create the file with or without initial content
+        content = pipe_input if pipe_input else ""
+        now = datetime.datetime.now().isoformat()
+        cursor.execute('''
+        INSERT INTO filesystem (name, type, parent_id, owner_id, content, size, modification_date)
+        VALUES (?, 'file', ?, ?, ?, ?, ?)
+        ''', (file_name, current_directory_id, current_user['id'], content, len(content), now))
+        conn.commit()
+        print(f"File '{file_name}' created.")
+    except sqlite3.IntegrityError as e:
+        print(f"Error: {e}")
 
-def wc(params):
-    if not current_user:
+
+def wc(params, pipe_input=None):
+    if not current_user and not pipe_input:
         print("No user logged in.")
         return
 
@@ -1144,10 +1317,6 @@ def wc(params):
             break  # Options are over
     filenames = params[idx:]
 
-    if not filenames:
-        print("Usage: wc [options] <file1> [file2 ...]")
-        return
-
     if default_behavior:
         count_lines = True
         count_words = True
@@ -1156,32 +1325,13 @@ def wc(params):
     total_lines = 0
     total_words = 0
     total_chars = 0
+    output = []
 
-    # Process each file
-    for filename in filenames:
-        file_id = get_item_id_by_path(filename, current_directory_id)
-        if not file_id:
-            print(f"wc: {filename}: No such file")
-            continue
-
-        # Check if it's a file
-        cursor.execute('SELECT type FROM filesystem WHERE id = ?', (file_id,))
-        item_type = cursor.fetchone()[0]
-        if item_type != 'file':
-            print(f"wc: {filename}: Is not a file")
-            continue
-
-        # Check read permission
-        if not has_permission(file_id, 'read'):
-            print(f"wc: {filename}: Permission denied")
-            continue
-
-        # Get file content
-        cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
-        content = cursor.fetchone()[0]
-        lines = content.split('\n')
-        words = content.split()
-        chars = len(content)
+    # If piped input is provided, use it directly
+    if pipe_input:
+        lines = pipe_input.split('\n')
+        words = pipe_input.split()
+        chars = len(pipe_input)
 
         num_lines = len(lines)
         num_words = len(words)
@@ -1191,7 +1341,7 @@ def wc(params):
         total_words += num_words
         total_chars += num_chars
 
-        # Build output string
+        # Build output for piped input
         output_parts = []
         if count_lines:
             output_parts.append(f"{num_lines}")
@@ -1199,20 +1349,95 @@ def wc(params):
             output_parts.append(f"{num_words}")
         if count_chars:
             output_parts.append(f"{num_chars}")
-        output_parts.append(filename)
-        print('\t'.join(output_parts))
+        output.append('\t'.join(output_parts))
+    else:
+        # Process each file
+        for filename in filenames:
+            file_id = get_item_id_by_path(filename, current_directory_id)
+            if not file_id:
+                print(f"wc: {filename}: No such file")
+                continue
 
-    # If multiple files, print total
-    if len(filenames) > 1:
-        output_parts = []
-        if count_lines:
-            output_parts.append(f"{total_lines}")
-        if count_words:
-            output_parts.append(f"{total_words}")
-        if count_chars:
-            output_parts.append(f"{total_chars}")
-        output_parts.append("total")
-        print('\t'.join(output_parts))
+            # Check if it's a file
+            cursor.execute('SELECT type FROM filesystem WHERE id = ?', (file_id,))
+            item_type = cursor.fetchone()[0]
+            if item_type != 'file':
+                print(f"wc: {filename}: Is not a file")
+                continue
+
+            # Check read permission
+            if not has_permission(file_id, 'read'):
+                print(f"wc: {filename}: Permission denied")
+                continue
+
+            # Get file content
+            cursor.execute('SELECT content FROM filesystem WHERE id = ?', (file_id,))
+            content = cursor.fetchone()[0]
+            lines = content.split('\n')
+            words = content.split()
+            chars = len(content)
+
+            num_lines = len(lines)
+            num_words = len(words)
+            num_chars = chars
+
+            total_lines += num_lines
+            total_words += num_words
+            total_chars += num_chars
+
+            # Build output string for the current file
+            output_parts = []
+            if count_lines:
+                output_parts.append(f"{num_lines}")
+            if count_words:
+                output_parts.append(f"{num_words}")
+            if count_chars:
+                output_parts.append(f"{num_chars}")
+            output_parts.append(filename)
+            output.append('\t'.join(output_parts))
+
+        # If multiple files, add totals
+        if len(filenames) > 1:
+            output_parts = []
+            if count_lines:
+                output_parts.append(f"{total_lines}")
+            if count_words:
+                output_parts.append(f"{total_words}")
+            if count_chars:
+                output_parts.append(f"{total_chars}")
+            output_parts.append("total")
+            output.append('\t'.join(output_parts))
+
+    # Print the results instead of returning them
+    for line in output:
+        print(line)
+
+
+current_username_color = "green"
+
+
+def color_command(params):
+    # Usage: color username <color_name>
+    if len(params) != 2:
+        print("Usage: color username <color>")
+        return
+    target, color = params
+    if target == 'username':
+        global current_username_color
+        current_username_color = color
+        print(f"Username color changed to {color}")
+    else:
+        print("Unknown target. Currently only 'username' is supported.")
+
+def get_prompt():
+    # Assuming current_user is a dictionary { 'username': 'jacob', ... }
+    if current_user:
+        username = current_user['username']
+        # Use Rich markup to color the username
+        prompt_username = f"[{current_username_color}]{username}[/]{get_current_directory_path()}$ "
+    else:
+        prompt_username = "guest_user$ "
+    return prompt_username
 
 def interpret_escape_sequences(s):
     escape_sequences = {
@@ -1257,145 +1482,142 @@ def shell():
             if current_user:
                 prompt = f"{current_user['username']}:{get_current_directory_path()}$ "
             else:
-                prompt = "guest_user$ "
+                prompt = "guest$ "
+
             try:
-                command_line = input(prompt)
-                if not command_line.strip():
+                command_line = input(prompt).strip()
+                if not command_line:
                     continue
-                args = command_line.strip().split()
-                command = args[0]
-                params = args[1:]
 
-                if command == 'exit':
-                    print("Exiting shell.")
-                    break
-                
-                elif command == 'grep':
-                    grep(params)
-
-                elif command == 'register':
-                    if len(params) != 0:
-                        print("Usage: register")
-                    else:
-                        username = input("Enter new username: ")
-                        password = getpass.getpass("Enter new password: ")
-                        # Confirm password
-                        confirm_password = getpass.getpass("Confirm password: ")
-                        if password != confirm_password:
-                            print("Passwords do not match. Registration aborted.")
+                # Check for pipeline
+                # Inside the shell function
+                if '|' in command_line:
+                    commands = command_line.split('|')
+                    pipe_input = None
+                    for cmd in commands:
+                        cmd = cmd.strip()
+                        if not cmd:
                             continue
-                        register(username, password)
+                        args = cmd.split()
+                        command = args[0]
+                        params = args[1:]
+                        pipe_input = execute_command_in_pipeline(command, params, pipe_input)
+                    if pipe_input:
+                        print(pipe_input)
 
-                elif command == 'login':
-                    if len(params) != 0:
-                        print("Usage: login")
-                    else:
-                        username = input("Enter username: ")
-                        password = getpass.getpass("Enter password: ")
-                        login(username, password)
-
-                elif command == 'logout':
-                    logout()
-                
-                elif command == 'ls':
-                    ls(params)  # Pass parameters to ls function
-                    
-                elif command == 'pwd':
-                    if params:
-                        print("Usage:pwd")
-                    else:
-                        pwd()
-
-                elif command == 'cd':
-                    if len(params) > 1:
-                        print("Usage: cd [directory]")
-                    else:
-                        directory_name = params[0] if params else None
-                        cd(directory_name)
-
-                elif command == 'mkdir':
-                    if len(params) != 1:
-                        print("Usage: mkdir <directory_name>")
-                    else:
-                        mkdir(params[0])
-                        
-                elif command == 'cp':
-                    if len(params) < 2:
-                        print("Usage: cp [-r] <source> <destination>")
-                    else: 
-                        recursive = False
-                        if params[0] == '-r':
-                            recursive = True
-                            params = params[1:]
-                        if len(params) !=2:
-                            print("Usage: cp [-r] <source> <destination>")
-                        else:
-                            source_path = params[0]
-                            destination_path = params[1]
-                            cp(source_path, destination_path, recursive)
-                
-                elif command == 'mv':
-                    if len(params) != 2:
-                        print("Usage: mv <source> <destination>")
-                    else:
-                        source_path = params[0]
-                        destination_path = params[1]
-                        mv(source_path, destination_path)
-                
-                elif command == 'head':
-                    head(params)
-
-                elif command == 'tail':
-                    tail(params)
-
-                elif command == 'touch':
-                    if len(params) != 1:
-                        print("Usage: touch <file_name>")
-                    else:
-                        touch(params[0])
-
-                elif command == 'rm':
-                    if len(params) != 1:
-                        print("Usage: rm <file_or_directory>")
-                    else:
-                        rm(params[0])
-                        
-                elif command == 'cat':
-                    if len(params) < 1:
-                        print("Usage: cat <file1> [file2 ...]")
-                    else:
-                        output_data = cat(params)
-                        if output_data:
-                            print(output_data)
-                    
-                    
-                elif command == 'write':
-                    write(params)
-
-                ##/elif command == 'cat':
-                    #if len(params) != 1:
-                    #   print("Usage: cat <file_name>")
-                    #else:
-                    #   cat(params[0])] 
-
-                elif command == 'echo':
-                    if len(params) < 2:
-                        print("Usage: echo <file_name> <content>")
-                    else:
-                        echo(params)
-                        
-                elif command == 'wc':
-                    wc(params)
-
-                elif command == 'chmod':
-                    if len(params) != 2:
-                        print("Usage: chmod <permissions> <file_or_directory>")
-                    else:
-                        chmod(params[1], params[0])
+                elif '>' in command_line or '<' in command_line or '>>' in command_line:
+                    # Handle redirection
+                    handle_redirection(command_line)
 
                 else:
-                    print(f"Unknown command: {command}")
-                    
+                    # Single command execution
+                    args = command_line.split()
+                    command = args[0]
+                    params = args[1:]
+
+                    if command == 'exit':
+                        print("Exiting shell.")
+                        break
+                    elif command == 'clear':
+                        clear(params)
+                    elif command == 'grep':
+                        grep(params)
+                    elif command == 'register':
+                        if len(params) != 0:
+                            print("Usage: register")
+                        else:
+                            username = input("Enter new username: ")
+                            password = getpass.getpass("Enter new password: ")
+                            confirm_password = getpass.getpass("Confirm password: ")
+                            if password != confirm_password:
+                                print("Passwords do not match. Registration aborted.")
+                                continue
+                            register(username, password)
+                    elif command == 'login':
+                        if len(params) != 0:
+                            print("Usage: login")
+                        else:
+                            username = input("Enter username: ")
+                            password = getpass.getpass("Enter password: ")
+                            login(username, password)
+                    elif command == 'logout':
+                        logout()
+                    elif command == 'ls':
+                        ls(params)
+                    elif command == 'pwd':
+                        if params:
+                            print("Usage: pwd")
+                        else:
+                            pwd()
+                    elif command == 'cd':
+                        if len(params) > 1:
+                            print("Usage: cd [directory]")
+                        else:
+                            cd(params[0] if params else None)
+                    elif command == 'mkdir':
+                        if len(params) != 1:
+                            print("Usage: mkdir <directory_name>")
+                        else:
+                            mkdir(params[0])
+                    elif command == 'cp':
+                        if len(params) < 2:
+                            print("Usage: cp [-r] <source> <destination>")
+                        else:
+                            recursive = False
+                            if params[0] == '-r':
+                                recursive = True
+                                params = params[1:]
+                            if len(params) != 2:
+                                print("Usage: cp [-r] <source> <destination>")
+                            else:
+                                cp(params[0], params[1], recursive)
+                    elif command == 'mv':
+                        if len(params) != 2:
+                            print("Usage: mv <source> <destination>")
+                        else:
+                            mv(params[0], params[1])
+                    elif command == 'head':
+                        head(params)
+                    elif command == 'tail':
+                        tail(params)
+                    elif command == 'color':
+                        color_command(params)
+                    elif command == 'touch':
+                        if len(params) != 1:
+                            print("Usage: touch <file_name>")
+                        else:
+                            touch(params)  # Pass the entire params list, even if it's just one element
+
+                    elif command == 'rm':
+                        if len(params) != 1:
+                            print("Usage: rm <file_or_directory>")
+                        else:
+                            rm(params[0])
+                    elif command == 'cat':
+                        if len(params) < 1:
+                            print("Usage: cat <file1> [file2 ...]")
+                        else:
+                            output_data = cat(params)
+                            if output_data:
+                                print(output_data)
+                    elif command == 'write':
+                        write(params)
+                    elif command == 'echo':
+                        if len(params) < 2:
+                            print("Usage: echo <file_name> <content>")
+                        else:
+                            echo(params)
+                    elif command == 'help':
+                        help_command(params)
+                    elif command == 'wc':
+                        wc(params)
+                    elif command == 'chmod':
+                        if len(params) != 2:
+                            print("Usage: chmod <permissions> <file_or_directory>")
+                        else:
+                            chmod(params[1], params[0])
+                    else:
+                        print(f"Unknown command: {command}")
             except KeyboardInterrupt:
                 print("\nUse 'exit' to quit the shell.")
             except EOFError:
@@ -1406,8 +1628,25 @@ def shell():
     finally:
         save_history()
 
-# Start the shell
+def execute_command_in_pipeline(command, params, pipe_input=None):
+    if command == 'cat':
+        return cat(params, pipe_input)
+    elif command == 'grep':
+        return grep(params, pipe_input)
+    elif command == 'head':
+        return head(params, pipe_input)
+    elif command == 'tail':
+        return tail(params, pipe_input)
+    elif command == 'wc':
+        return wc(params, pipe_input)
+    elif command == 'echo':
+        return echo(params, pipe_input)
+    else:
+        print(f"Unknown command: {command}")
+        return None
+
 if __name__ == "__main__":
-    print("Welcome to the shell, type register to create an account\nOtherwise type login to begin login process.\nWhen finished type exit to quit shell.")
+    print("Type register to make an account\nOtherwise type login to begin login process.\nWhen finished type exit to quit shell.")
     shell()
     conn.close()
+
